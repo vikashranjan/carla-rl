@@ -661,9 +661,27 @@ DISCRETE_ACTIONS = {
 }
 
 
+# Default environment configuration
+ENV_CONFIG = {
+    "discrete_actions": True,
+    "use_image_only_observations": True,  # Exclude high-level planner inputs & goal info from the observations
+    "server_map": "/Game/Maps/" + city,
+    "scenarios": [scenario_config["Lane_Keep_Town2"]],
+    "framestack": 2,  # note: only [1, 2] currently supported
+    "enable_planner": True,
+    "use_depth_camera": False,
+    "early_terminate_on_collision": True,
+    "verbose": False,
+    "render" : True,  # Render to display if true
+    "render_x_res": 800,
+    "render_y_res": 600,
+    "x_res": 80,
+    "y_res": 80,
+    "seed": 1
+}
 
 class CarlaEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, config=ENV_CONFIG):
         """
         Carla Gym Environment class implementation. Creates an OpenAI Gym compatible driving environment based on
         Carla driving simulator.
