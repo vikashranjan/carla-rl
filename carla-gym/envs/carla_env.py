@@ -31,7 +31,7 @@ import math
 import random
 import re
 import weakref
-
+import pygame
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -133,6 +133,63 @@ class World(object):
         for actor in actors:
             if actor is not None:
                 actor.destroy()
+
+# ==============================================================================
+# -- FadingText ----------------------------------------------------------------
+# ==============================================================================
+
+
+class FadingText(object):
+    def __init__(self, font, dim, pos):
+        self.font = font
+        self.dim = dim
+        self.pos = pos
+        self.seconds_left = 0
+        self.surface = pygame.Surface(self.dim)
+
+    def set_text(self, text, color=(255, 255, 255), seconds=2.0):
+        text_texture = self.font.render(text, True, color)
+        self.surface = pygame.Surface(self.dim)
+        self.seconds_left = seconds
+        self.surface.fill((0, 0, 0, 0))
+        self.surface.blit(text_texture, (10, 11))
+
+    def tick(self, _, clock):
+        delta_seconds = 1e-3 * clock.get_time()
+        self.seconds_left = max(0.0, self.seconds_left - delta_seconds)
+        self.surface.set_alpha(500.0 * self.seconds_left)
+
+    def render(self, display):
+        display.blit(self.surface, self.pos)
+
+
+# ==============================================================================
+# -- HelpText ------------------------------------------------------------------
+# ==============================================================================
+
+
+class HelpText(object):
+    def __init__(self, font, width, height):
+        lines = __doc__.split('\n')
+        self.font = font
+        self.dim = (680, len(lines) * 22 + 12)
+        self.pos = (0.5 * width - 0.5 * self.dim[0], 0.5 * height - 0.5 * self.dim[1])
+        self.seconds_left = 0
+        self.surface = pygame.Surface(self.dim)
+        self.surface.fill((0, 0, 0, 0))
+        for n, line in enumerate(lines):
+            text_texture = self.font.render(line, True, (255, 255, 255))
+            self.surface.blit(text_texture, (22, n * 22))
+            self._render = False
+        self.surface.set_alpha(220)
+
+    def toggle(self):
+        self._render = not self._render
+
+    def render(self, display):
+        if self._render:
+            display.blit(self.surface, self.pos)
+
 
 
 # ==============================================================================
@@ -471,103 +528,95 @@ class CameraManager(object):
 
 class CarlaControl(object):
     def __init__(self, world, start_in_autopilot):
-        self._autopilot_enabled = start_in_autopilot
-        if isinstance(world.player, carla.Vehicle):
-            self._control = carla.VehicleControl()
-            world.player.set_autopilot(self._autopilot_enabled)
-        elif isinstance(world.player, carla.Walker):
-            self._control = carla.WalkerControl()
-            self._autopilot_enabled = False
-            self._rotation = world.player.get_transform().rotation
-        else:
-            raise NotImplementedError("Actor type not supported")
+
+        self._control = carla.VehicleControl()
+        world.player.set_autopilot(self._autopilot_enabled)
         self._steer_cache = 0.0
-        world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
+       
+    # def parse_events(self, client, world, clock):
+    #     for event in pygame.event.get():
+    #         if event.type == pygame.QUIT:
+    #             return True
+    #         elif event.type == pygame.KEYUP:
+    #             if self._is_quit_shortcut(event.key):
+    #                 return True
+    #             elif event.key == K_BACKSPACE:
+    #                 world.restart()
+    #             elif event.key == K_F1:
+    #                 world.hud.toggle_info()
+    #             elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT):
+    #                 world.hud.help.toggle()
+    #             elif event.key == K_TAB:
+    #                 world.camera_manager.toggle_camera()
+    #             elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
+    #                 world.next_weather(reverse=True)
+    #             elif event.key == K_c:
+    #                 world.next_weather()
+    #             elif event.key == K_BACKQUOTE:
+    #                 world.camera_manager.next_sensor()
+    #             elif event.key > K_0 and event.key <= K_9:
+    #                 world.camera_manager.set_sensor(event.key - 1 - K_0)
+    #             elif event.key == K_r and not (pygame.key.get_mods() & KMOD_CTRL):
+    #                 world.camera_manager.toggle_recording()
+    #             elif event.key == K_r and (pygame.key.get_mods() & KMOD_CTRL):
+    #                 if (world.recording_enabled):
+    #                     client.stop_recorder()
+    #                     world.recording_enabled = False
+    #                     world.hud.notification("Recorder is OFF")
+    #                 else:
+    #                     client.start_recorder("manual_recording.rec")
+    #                     world.recording_enabled = True
+    #                     world.hud.notification("Recorder is ON")
+    #             elif event.key == K_p and (pygame.key.get_mods() & KMOD_CTRL):
+    #                 # stop recorder
+    #                 client.stop_recorder()
+    #                 world.recording_enabled = False
+    #                 # work around to fix camera at start of replaying
+    #                 currentIndex = world.camera_manager._index
+    #                 world.destroySensors()
+    #                 # disable autopilot
+    #                 self._autopilot_enabled = False
+    #                 world.player.set_autopilot(self._autopilot_enabled)
+    #                 world.hud.notification("Replaying file 'manual_recording.rec'")
+    #                 # replayer
+    #                 client.replay_file("manual_recording.rec", world.recording_start, 0, 0)
+    #                 world.camera_manager.set_sensor(currentIndex)
+    #             elif event.key == K_MINUS and (pygame.key.get_mods() & KMOD_CTRL):
+    #                 if pygame.key.get_mods() & KMOD_SHIFT:
+    #                     world.recording_start -= 10
+    #                 else:
+    #                     world.recording_start -= 1
+    #                 world.hud.notification("Recording start time is %d" % (world.recording_start))
+    #             elif event.key == K_EQUALS and (pygame.key.get_mods() & KMOD_CTRL):
+    #                 if pygame.key.get_mods() & KMOD_SHIFT:
+    #                     world.recording_start += 10
+    #                 else:
+    #                     world.recording_start += 1
+    #                 world.hud.notification("Recording start time is %d" % (world.recording_start))
+    #             if isinstance(self._control, carla.VehicleControl):
+    #                 if event.key == K_q:
+    #                     self._control.gear = 1 if self._control.reverse else -1
+    #                 elif event.key == K_m:
+    #                     self._control.manual_gear_shift = not self._control.manual_gear_shift
+    #                     self._control.gear = world.player.get_control().gear
+    #                     world.hud.notification('%s Transmission' % ('Manual' if self._control.manual_gear_shift else 'Automatic'))
+    #                 elif self._control.manual_gear_shift and event.key == K_COMMA:
+    #                     self._control.gear = max(-1, self._control.gear - 1)
+    #                 elif self._control.manual_gear_shift and event.key == K_PERIOD:
+    #                     self._control.gear = self._control.gear + 1
+    #                 elif event.key == K_p and not (pygame.key.get_mods() & KMOD_CTRL):
+    #                     self._autopilot_enabled = not self._autopilot_enabled
+    #                     world.player.set_autopilot(self._autopilot_enabled)
+    #                     world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
+    #     if not self._autopilot_enabled:
+    #         if isinstance(self._control, carla.VehicleControl):
+    #             self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+    #             self._control.reverse = self._control.gear < 0
+    #         elif isinstance(self._control, carla.WalkerControl):
+    #             self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time())
+    #         world.player.apply_control(self._control)
 
-    def parse_events(self, client, world, clock):
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return True
-            elif event.type == pygame.KEYUP:
-                if self._is_quit_shortcut(event.key):
-                    return True
-                elif event.key == K_BACKSPACE:
-                    world.restart()
-                elif event.key == K_F1:
-                    world.hud.toggle_info()
-                elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT):
-                    world.hud.help.toggle()
-                elif event.key == K_TAB:
-                    world.camera_manager.toggle_camera()
-                elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
-                    world.next_weather(reverse=True)
-                elif event.key == K_c:
-                    world.next_weather()
-                elif event.key == K_BACKQUOTE:
-                    world.camera_manager.next_sensor()
-                elif event.key > K_0 and event.key <= K_9:
-                    world.camera_manager.set_sensor(event.key - 1 - K_0)
-                elif event.key == K_r and not (pygame.key.get_mods() & KMOD_CTRL):
-                    world.camera_manager.toggle_recording()
-                elif event.key == K_r and (pygame.key.get_mods() & KMOD_CTRL):
-                    if (world.recording_enabled):
-                        client.stop_recorder()
-                        world.recording_enabled = False
-                        world.hud.notification("Recorder is OFF")
-                    else:
-                        client.start_recorder("manual_recording.rec")
-                        world.recording_enabled = True
-                        world.hud.notification("Recorder is ON")
-                elif event.key == K_p and (pygame.key.get_mods() & KMOD_CTRL):
-                    # stop recorder
-                    client.stop_recorder()
-                    world.recording_enabled = False
-                    # work around to fix camera at start of replaying
-                    currentIndex = world.camera_manager._index
-                    world.destroySensors()
-                    # disable autopilot
-                    self._autopilot_enabled = False
-                    world.player.set_autopilot(self._autopilot_enabled)
-                    world.hud.notification("Replaying file 'manual_recording.rec'")
-                    # replayer
-                    client.replay_file("manual_recording.rec", world.recording_start, 0, 0)
-                    world.camera_manager.set_sensor(currentIndex)
-                elif event.key == K_MINUS and (pygame.key.get_mods() & KMOD_CTRL):
-                    if pygame.key.get_mods() & KMOD_SHIFT:
-                        world.recording_start -= 10
-                    else:
-                        world.recording_start -= 1
-                    world.hud.notification("Recording start time is %d" % (world.recording_start))
-                elif event.key == K_EQUALS and (pygame.key.get_mods() & KMOD_CTRL):
-                    if pygame.key.get_mods() & KMOD_SHIFT:
-                        world.recording_start += 10
-                    else:
-                        world.recording_start += 1
-                    world.hud.notification("Recording start time is %d" % (world.recording_start))
-                if isinstance(self._control, carla.VehicleControl):
-                    if event.key == K_q:
-                        self._control.gear = 1 if self._control.reverse else -1
-                    elif event.key == K_m:
-                        self._control.manual_gear_shift = not self._control.manual_gear_shift
-                        self._control.gear = world.player.get_control().gear
-                        world.hud.notification('%s Transmission' % ('Manual' if self._control.manual_gear_shift else 'Automatic'))
-                    elif self._control.manual_gear_shift and event.key == K_COMMA:
-                        self._control.gear = max(-1, self._control.gear - 1)
-                    elif self._control.manual_gear_shift and event.key == K_PERIOD:
-                        self._control.gear = self._control.gear + 1
-                    elif event.key == K_p and not (pygame.key.get_mods() & KMOD_CTRL):
-                        self._autopilot_enabled = not self._autopilot_enabled
-                        world.player.set_autopilot(self._autopilot_enabled)
-                        world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
-        if not self._autopilot_enabled:
-            if isinstance(self._control, carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
-                self._control.reverse = self._control.gear < 0
-            elif isinstance(self._control, carla.WalkerControl):
-                self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time())
-            world.player.apply_control(self._control)
-
-    def _parse_vehicle_keys(self, keys, milliseconds):
+    def _apply_vehicle_action(self, keys, milliseconds):
         self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
@@ -581,32 +630,22 @@ class CarlaControl(object):
         self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
 
-    def _parse_walker_keys(self, keys, milliseconds):
-        self._control.speed = 0.0
-        if keys[K_DOWN] or keys[K_s]:
-            self._control.speed = 0.0
-        if keys[K_LEFT] or keys[K_a]:
-            self._control.speed = .01
-            self._rotation.yaw -= 0.08 * milliseconds
-        if keys[K_RIGHT] or keys[K_d]:
-            self._control.speed = .01
-            self._rotation.yaw += 0.08 * milliseconds
-        if keys[K_UP] or keys[K_w]:
-            self._control.speed = 5.556 if pygame.key.get_mods() & KMOD_SHIFT else 2.778
-        self._control.jump = keys[K_SPACE]
-        self._rotation.yaw = round(self._rotation.yaw, 1)
-        self._control.direction = self._rotation.get_forward_vector()
+    # def _parse_walker_keys(self, keys, milliseconds):
+    #     self._control.speed = 0.0
+    #     if keys[K_DOWN] or keys[K_s]:
+    #         self._control.speed = 0.0
+    #     if keys[K_LEFT] or keys[K_a]:
+    #         self._control.speed = .01
+    #         self._rotation.yaw -= 0.08 * milliseconds
+    #     if keys[K_RIGHT] or keys[K_d]:
+    #         self._control.speed = .01
+    #         self._rotation.yaw += 0.08 * milliseconds
+    #     if keys[K_UP] or keys[K_w]:
+    #         self._control.speed = 5.556 if pygame.key.get_mods() & KMOD_SHIFT else 2.778
+    #     self._control.jump = keys[K_SPACE]
+    #     self._rotation.yaw = round(self._rotation.yaw, 1)
+    #     self._control.direction = self._rotation.get_forward_vector()
 
-    @staticmethod
-    def _is_quit_shortcut(key):
-        return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
-
-
-
-# Number of retries if the server doesn't respond
-RETRIES_ON_ERROR = 4
-# Dummy Z coordinate to use when we only care about (x, y)
-GROUND_Z = 22
 
 # Define the discrete action space
 DISCRETE_ACTIONS = {
@@ -621,16 +660,10 @@ DISCRETE_ACTIONS = {
     8: [-0.5, 0.5],   # Bear Right & decelerate
 }
 
-live_carla_processes = set()  # To keep track of all the Carla processes we launch to make the cleanup easier
-def cleanup():
-    print("Killing live carla processes", live_carla_processes)
-    for pgid in live_carla_processes:
-        os.killpg(pgid, signal.SIGKILL)
-atexit.register(cleanup)
 
 
 class CarlaEnv(gym.Env):
-    def __init__(self, config=ENV_CONFIG):
+    def __init__(self):
         """
         Carla Gym Environment class implementation. Creates an OpenAI Gym compatible driving environment based on
         Carla driving simulator.
