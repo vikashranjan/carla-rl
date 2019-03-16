@@ -98,7 +98,7 @@ class World(object):
             blueprint.set_attribute('color', color)
 
         # Spawn actors
-        spawn_points = list(self.get_map().get_spawn_points())
+        spawn_points = list(self.world.get_map().get_spawn_points())
         random.shuffle(spawn_points)
         count = self.number_of_vehicles
         while count > 0:
@@ -719,6 +719,15 @@ COMMANDS_ENUM = {
     LANE_FOLLOW: "LANE_FOLLOW",
 }
 
+COMMAND_ORDINAL = {
+    "REACH_GOAL": 0,
+    "GO_STRAIGHT": 1,
+    "TURN_RIGHT": 2,
+    "TURN_LEFT": 3,
+    "LANE_FOLLOW": 4,
+}
+
+GROUND_Z=22
 
 class CarlaEnv(gym.Env):
     def __init__(self, config=ENV_CONFIG):
@@ -780,7 +789,7 @@ class CarlaEnv(gym.Env):
         error = None
         for _ in range(RETRIES_ON_ERROR):
             try:
-                self.world.restart()
+                self.reset_env()
             except Exception as e:
                 print("Error during reset: {}".format(traceback.format_exc()))
                 error = e
@@ -793,58 +802,28 @@ class CarlaEnv(gym.Env):
         self.prev_image = None
         self.episode_id = datetime.today().strftime("%Y-%m-%d_%H-%M-%S_%f")
         self.measurements_file = None
+        self.world.restart()
 
-        # Create a CarlaSettings object. This object is a wrapper around
-        # the CarlaSettings.ini file. Here we set the configuration we
-        # want for the new episode.
-        settings = CarlaSettings()
-        # If config["scenarios"] is a single scenario, then use it if it's an array of scenarios, randomly choose one and init
-        if isinstance(self.config["scenarios"], dict):
-            self.scenario = self.config["scenarios"]
-        else:  # isinstance array of dict
-            self.scenario = random.choice(self.config["scenarios"])
-        assert self.scenario["city"] == self.city, (self.scenario, self.city)
-        self.weather = random.choice(self.scenario["weather_distribution"])
-        settings.set(
-            SynchronousMode=True,
-            SendNonPlayerAgentsInfo=True,
-            NumberOfVehicles=self.scenario["num_vehicles"],
-            NumberOfPedestrians=self.scenario["num_pedestrians"],
-            WeatherId=self.weather)
-        settings.randomize_seeds()
 
-        if self.config["use_depth_camera"]:
-            camera1 = Camera("CameraDepth", PostProcessing="Depth")
-            camera1.set_image_size(
-                self.config["render_x_res"], self.config["render_y_res"])
-            camera1.set_position(30, 0, 130)
-            settings.add_sensor(camera1)
-
-        camera2 = Camera("CameraRGB")
-        camera2.set_image_size(
-            self.config["render_x_res"], self.config["render_y_res"])
-        camera2.set_position(30, 0, 130)
-        settings.add_sensor(camera2)
-
-        # Setup start and end positions
-        scene = self.client.load_settings(settings)
-        positions = scene.player_start_spots
-        self.start_pos = positions[self.scenario["start_pos_id"]]
-        self.end_pos = positions[self.scenario["end_pos_id"]]
-        self.start_coord = [
-            self.start_pos.location.x // 100, self.start_pos.location.y // 100]
-        self.end_coord = [
-            self.end_pos.location.x // 100, self.end_pos.location.y // 100]
-        print(
-            "Start pos {} ({}), end {} ({})".format(
-                self.scenario["start_pos_id"], self.start_coord,
-                self.scenario["end_pos_id"], self.end_coord))
-
-        # Notify the server that we want to start the episode at the
-        # player_start index. This function blocks until the server is ready
-        # to start the episode.
-        print("Starting new episode...")
-        self.client.start_episode(self.scenario["start_pos_id"])
+        # # Setup start and end positions
+        # scene = self.client.load_settings(settings)
+        # positions = scene.player_start_spots
+        # self.start_pos = positions[self.scenario["start_pos_id"]]
+        # self.end_pos = positions[self.scenario["end_pos_id"]]
+        # self.start_coord = [
+        #     self.start_pos.location.x // 100, self.start_pos.location.y // 100]
+        # self.end_coord = [
+        #     self.end_pos.location.x // 100, self.end_pos.location.y // 100]
+        # print(
+        #     "Start pos {} ({}), end {} ({})".format(
+        #         self.scenario["start_pos_id"], self.start_coord,
+        #         self.scenario["end_pos_id"], self.end_coord))
+        #
+        # # Notify the server that we want to start the episode at the
+        # # player_start index. This function blocks until the server is ready
+        # # to start the episode.
+        # print("Starting new episode...")
+        # self.client.start_episode(self.scenario["start_pos_id"])
 
         image, py_measurements = self._read_observation()
         self.prev_measurement = py_measurements
