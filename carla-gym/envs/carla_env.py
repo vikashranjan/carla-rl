@@ -69,11 +69,12 @@ class World(object):
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = actor_filter
-        self.restart()
+
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
         self.recording_start = 0
         self.number_of_vehicles = number_of_vehicles
+        self.restart()
 
     def try_spawn_random_vehicle_at(self, transform, blueprints):
         blueprint = random.choice(blueprints)
@@ -567,6 +568,13 @@ class CarlaControl(object):
         return self._control
 
 
+# Load scenario configuration parameters from scenarios.json
+__location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
+scenario_config = json.load(open(os.path.join(__location__, "scenarios.json")))
+city = scenario_config["city"][1]  # Town2
+weathers = [scenario_config['Weather']['WetNoon'], scenario_config['Weather']['ClearSunset']]
+scenario_config['Weather_distribution'] = weathers
+
 # Define the discrete action space
 DISCRETE_ACTIONS = {
     0: [0.0, 0.0],  # Coast
@@ -603,6 +611,13 @@ ENV_CONFIG = {
     "filter": "vehicle.*"
 }
 RETRIES_ON_ERROR = 4
+
+REACH_GOAL = 0
+GO_STRAIGHT = 1
+TURN_RIGHT = 2
+TURN_LEFT = 3
+LANE_FOLLOW = 4
+
 # Carla planner commands
 COMMANDS_ENUM = {
     REACH_GOAL: "REACH_GOAL",
@@ -638,18 +653,18 @@ class CarlaEnv(gym.Env):
         client = carla.Client(config["server_host"], config["server_port"])
         client.set_timeout(config["server_timeout"])
 
-        display = pygame.display.set_mode(
-            ((config["render_x_res"], (config["render_y_res"]),
-              pygame.HWSURFACE | pygame.DOUBLEBUF)))
+        # display = pygame.display.set_mode(
+        #     ((config["render_x_res"], (config["render_y_res"]),
+        #       pygame.HWSURFACE | pygame.DOUBLEBUF)))
 
         hud = HUD(config["render_x_res"], (config["render_y_res"]))
-        world = World(client.get_world(), hud, config["filter"])
+        world = World(client.get_world(), hud, config["filter"],20)
         controller = CarlaControl(world)
 
         clock = pygame.time.Clock()
 
         self.client = client
-        self.display = display
+        #self.display = display
         self.hud = hud
         self.world = world
         self.controller = controller
@@ -658,12 +673,21 @@ class CarlaEnv(gym.Env):
         self.control = CarlaControl()
 
         self.city = self.config["server_map"].split("/")[-1]
+
+        self.server_port = None
+        self.client = None
         self.num_steps = 0
         self.total_reward = 0
-        self.prev_image = None
-        self.episode_id = datetime.today().strftime("%Y-%m-%d_%H-%M-%S_%f")
-        self.measurements_file = None
         self.prev_measurement = None
+        self.prev_image = None
+        self.episode_id = None
+        self.measurements_file = None
+        self.weather = None
+        self.scenario = None
+        self.start_pos = None
+        self.end_pos = None
+        self.start_coord = None
+        self.end_coord = None
         self.last_obs = None
 
         if config["discrete_actions"]:
@@ -708,7 +732,7 @@ class CarlaEnv(gym.Env):
         self.world.restart()
 
         # # Setup start and end positions
-        # scene = self.client.load_settings(settings)
+        #scene = self.client.load_settings(settings)
         # positions = scene.player_start_spots
         # self.start_pos = positions[self.scenario["start_pos_id"]]
         # self.end_pos = positions[self.scenario["end_pos_id"]]
@@ -758,8 +782,8 @@ class CarlaEnv(gym.Env):
             print(
                 "Error during step, terminating episode early",
                 traceback.format_exc())
-            self.clear_server_state()
-            return (self.last_obs, 0.0, True, {})
+
+            return self.last_obs, 0.0, True, {}
 
     def step_env(self, action):
         if self.config["discrete_actions"]:
