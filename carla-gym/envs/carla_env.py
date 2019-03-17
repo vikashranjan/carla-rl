@@ -25,7 +25,7 @@ from carla import ColorConverter as cc
 
 import argparse
 import collections
-import datetime
+
 import logging
 import math
 import random
@@ -76,15 +76,15 @@ class World(object):
         self.number_of_vehicles = number_of_vehicles
         self.restart()
 
-    def try_spawn_random_vehicle_at(self, transform, blueprints):
-        blueprint = random.choice(blueprints)
+    def try_spawn_random_vehicle_at(self, transform, blueprint):
+        #blueprint = random.choice(blueprints)
         if blueprint.has_attribute('color'):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
             blueprint.set_attribute('color', color)
         blueprint.set_attribute('role_name', 'autopilot')
-        vehicle = self.try_spawn_actor(blueprint, transform)
-        vehicle.set_autopilot()
-        print('spawned %r at %s' % (vehicle.type_id, transform.location))
+        vehicle = self.world.try_spawn_actor(blueprint, transform)
+        vehicle.set_autopilot(True)
+        #print('spawned %s at %s' % (str(vehicle.type_id), str(transform.location)))
         return vehicle
 
     def restart(self):
@@ -645,6 +645,22 @@ class CarlaEnv(gym.Env):
         Carla driving simulator.
         :param config: A dictionary with environment configuration keys and values
         """
+        self.server_port = None
+        self.client = None
+        self.num_steps = 0
+        self.total_reward = 0
+        self.prev_measurement = None
+        self.prev_image = None
+        self.episode_id = None
+        self.measurements_file = None
+        self.weather = None
+        self.scenario = None
+        self.start_pos = None
+        self.end_pos = None
+        self.start_coord = None
+        self.end_coord = None
+        self.last_obs = None
+
         self.config = config
 
         pygame.init()
@@ -670,25 +686,9 @@ class CarlaEnv(gym.Env):
         self.controller = controller
         self.clock = clock
 
-        self.control = CarlaControl()
+        self.control = CarlaControl(world)
 
         self.city = self.config["server_map"].split("/")[-1]
-
-        self.server_port = None
-        self.client = None
-        self.num_steps = 0
-        self.total_reward = 0
-        self.prev_measurement = None
-        self.prev_image = None
-        self.episode_id = None
-        self.measurements_file = None
-        self.weather = None
-        self.scenario = None
-        self.start_pos = None
-        self.end_pos = None
-        self.start_coord = None
-        self.end_coord = None
-        self.last_obs = None
 
         if config["discrete_actions"]:
             self.action_space = Discrete(len(DISCRETE_ACTIONS))
