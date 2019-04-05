@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# Batched n-step Advantage Actor-Critic Agent (A2C) | Praveen Palanisamy
-# Chapter 8, Hands-on Intelligent Agents with OpenAI Gym, 2018
-
 from argparse import ArgumentParser
 from datetime import datetime
 from collections import namedtuple
@@ -11,7 +7,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.distributions.categorical import Categorical
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from environment.utils import SubprocVecEnv
+from utils.env_rep import SubprocVecEnv
 try:
     import roboschool
 except ImportError:

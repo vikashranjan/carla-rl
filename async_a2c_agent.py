@@ -1,9 +1,6 @@
-#!/usr/bin/env python
-# n-step Advantage Actor-Critic Agent (A2C) | Praveen Palanisamy
-# Chapter 8, Hands-on Intelligent Agents with OpenAI Gym, 2018
-
 from argparse import ArgumentParser
 from datetime import datetime
+import time
 from collections import namedtuple
 import numpy as np
 import torch
@@ -11,6 +8,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.distributions.categorical import Categorical
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+#from environment.utils import make_env
 import gym
 try:
     import roboschool
@@ -25,22 +23,19 @@ from function_approximator.deep import Actor as DeepActor
 from function_approximator.deep import DiscreteActor as DeepDiscreteActor
 from function_approximator.deep import Critic as DeepCritic
 from environment import carla_gym
-import environment.atari as Atari
+import utils.atari as Atari
 
 parser = ArgumentParser("deep_ac_agent")
-parser.add_argument("--env", help="Name of the Gym environment",
-                    default="Pendulum-v0", metavar="ENV_ID")
-parser.add_argument("--params-file", default="a2c_parameters.json",
-                    help="Path to parameters file.Default=a2c_parameters.json",
-                    metavar="a2c_parameters.json")
+parser.add_argument("--env", help="Name of the Gym environment", default="Pendulum-v0", metavar="ENV_ID")
+parser.add_argument("--params-file", help="Path to the parameters file. Default= ./async_a2c_parameters.json",
+                    default="async_a2c_parameters.json", metavar="async_a2c_parameters.json")
 parser.add_argument("--model-dir", default="trained_models/", metavar="MODEL_DIR",
                     help="Directory to save/load trained model. Default= ./trained_models/")
 parser.add_argument("--render", action='store_true', default=False,
                     help="Whether to render the environment to the display. Default=False")
-parser.add_argument("--test", action='store_true', default=False,
-                    help="Tests a saved Agent model to see the performance. Disables learning")
-parser.add_argument("--gpu-id", type=int, default=0, metavar="GPU_ID",
-                    help="GPU device ID to use. Default:0")
+parser.add_argument("--test", help="Tests a saved Agent model to see the performance. Disables learning",
+                    action='store_true', default=False)
+parser.add_argument("--gpu-id", help="GPU device ID to use. Default:0", type=int, default=0, metavar="GPU_ID")
 args = parser.parse_args()
 
 global_step_num = 0
@@ -63,29 +58,33 @@ if torch.cuda.is_available() and use_cuda:
 
 Transition = namedtuple("Transition", ["s", "value_s", "a", "log_prob_a"])
 
+
 class DeepActorCriticAgent(mp.Process):
-    def __init__(self, id, env_name, agent_params, env_params):
+    def __init__(self, id, env_name, agent_params, shared_state, env_params):
         """
-        An Advantage Actor-Critic Agent that uses a Deep Neural Network to represent it's Policy and the Value function
-        :param id: An integer ID to identify the agent in case there are multiple agent instances
-        :param env_name: Name/ID of the environment
-        :param agent_params: Parameters to be used by the agent
+        An Asynchronous implementation of an Advantage Actor-Critic Agent that uses a Deep Neural Network to represent it's Policy and the Value function
+        :param state_shape:
+        :param action_shape:
         """
         super(DeepActorCriticAgent, self).__init__()
         self.id = id
-        self.actor_name = "actor" + str(self.id)
+        if id == 0:
+            self.actor_name = "global"
+        else:
+            self.actor_name = "actor" + str(self.id)
+        self.shared_state = shared_state
         self.env_name = env_name
         self.params = agent_params
         self.env_conf = env_params
         self.policy = self.multi_variate_gaussian_policy
         self.gamma = self.params['gamma']
         self.trajectory = []  # Contains the trajectory of the agent as a sequence of Transitions
-        self.rewards = []  #  Contains the rewards obtained from the env at every step
+        self.rewards = []  # Contains the rewards obtained from the env at every step
         self.global_step_num = 0
         self.best_mean_reward = - float("inf") # Agent's personal best mean episode reward
         self.best_reward = - float("inf")
         self.saved_params = False  # Whether or not the params have been saved along with the model to model_dir
-        self.continuous_action_space = True  #Assumption by default unless env.action_space is Discrete
+        self.continuous_action_space = True  # Assumption by default unless env.action_space is Discrete
 
     def multi_variate_gaussian_policy(self, obs):
         """
@@ -102,7 +101,7 @@ class DeepActorCriticAgent(mp.Process):
         self.sigma = sigma.to(torch.device("cpu"))
         self.value = value.to(torch.device("cpu"))
         if len(self.mu.shape) == 0: # See if mu is a scalar
-            #self.mu = self.mu.unsqueeze(0)  # This prevents MultivariateNormal from crashing with SIGFPE
+            # self.mu = self.mu.unsqueeze(0)  # This prevents MultivariateNormal from crashing with SIGFPE
             self.mu.unsqueeze_(0)
         self.action_distribution = MultivariateNormal(self.mu, torch.eye(self.action_shape) * self.sigma, validate_args=True)
         return self.action_distribution
@@ -123,7 +122,7 @@ class DeepActorCriticAgent(mp.Process):
     def preproc_obs(self, obs):
         obs = np.array(obs)  # Obs could be lazy frames. So, force fetch before moving forward
         if len(obs.shape) == 3:
-            #  Reshape obs from (H x W x C) order to this order: C x W x H and resize to (C x 84 x 84)
+            # Reshape obs from (H x W x C) order to this order: C x W x H and resize to (C x 84 x 84)
             obs = np.reshape(obs, (obs.shape[2], obs.shape[1], obs.shape[0]))
             obs = np.resize(obs, (obs.shape[0], 84, 84))
         #  Convert to torch Tensor, add a batch dimension, convert to float repr
@@ -144,7 +143,7 @@ class DeepActorCriticAgent(mp.Process):
         action = action_distribution.sample()
         log_prob_a = action_distribution.log_prob(action)
         action = self.process_action(action)
-        # Store the n-step trajectory while training. Skip storing the trajectories in test mode
+        # Store the n-step trajectory for learning. Skip storing the trajectories in test only mode
         if not self.params["test"]:
             self.trajectory.append(Transition(obs, value, action, log_prob_a))  # Construct the trajectory
         return action
@@ -186,10 +185,28 @@ class DeepActorCriticAgent(mp.Process):
             actor_loss = torch.stack(actor_losses).mean()
         critic_loss = torch.stack(critic_losses).mean()
 
-        writer.add_scalar(self.actor_name + "/critic_loss", critic_loss, self.global_step_num)
-        writer.add_scalar(self.actor_name + "/actor_loss", actor_loss, self.global_step_num)
+        if self.actor_name == "global":
+            writer.add_scalar(self.actor_name + "/critic_loss", critic_loss, self.global_step_num)
+            writer.add_scalar(self.actor_name + "/actor_loss", actor_loss, self.global_step_num)
 
         return actor_loss, critic_loss
+
+    def pull_params_from_global_agent(self):
+        # If this is the very beginning of the procs, the global agent may not have started yet.
+        # Wait for the global agent proc to start and make the shared state dict available
+        while "actor_state_dict" not in self.shared_state or "critic_state_dict" not in self.shared_state:
+            time.sleep(2)
+        self.actor.load_state_dict(self.shared_state["actor_state_dict"])
+        self.critic.load_state_dict(self.shared_state["critic_state_dict"])
+        self.actor.to(device)
+        self.critic.to(device)
+
+    def push_params_to_global_agent(self):
+        self.shared_state["actor_state_dict"] = self.actor.cpu().state_dict()
+        self.shared_state["critic_state_dict"] = self.critic.cpu().state_dict()
+        # To make sure that the actor & critic models are on the desired device
+        self.actor.to(device)
+        self.critic.to(device)
 
     def learn(self, n_th_observation, done):
         if self.params["clip_rewards"]:
@@ -209,7 +226,7 @@ class DeepActorCriticAgent(mp.Process):
         self.rewards.clear()
 
     def save(self):
-        model_file_name = self.params["model_dir"] + "A2C_" + self.env_name + ".ptm"
+        model_file_name = self.params["model_dir"] + "Async-A2C_" + self.env_name + ".ptm"
         agent_state = {"Actor": self.actor.state_dict(),
                        "Critic": self.critic.state_dict(),
                        "best_mean_reward": self.best_mean_reward,
@@ -223,7 +240,7 @@ class DeepActorCriticAgent(mp.Process):
             self.saved_params = True
 
     def load(self):
-        model_file_name = self.params["model_dir"] + "A2C_" + self.env_name + ".ptm"
+        model_file_name = self.params["model_dir"] + "Async-A2C_" + self.env_name + ".ptm"
         agent_state = torch.load(model_file_name, map_location= lambda storage, loc: storage)
         self.actor.load_state_dict(agent_state["Actor"])
         self.critic.load_state_dict(agent_state["Critic"])
@@ -279,41 +296,53 @@ class DeepActorCriticAgent(mp.Process):
             else:  # Discrete action space
                 self.actor = ShallowDiscreteActor(self.state_shape, self.action_shape, device).to(device)
             self.critic = ShallowCritic(self.state_shape, self.critic_shape, device).to(device)
+
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.params["learning_rate"])
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.params["learning_rate"])
 
-        # Handle loading and saving of trained Agent models
-        episode_rewards = list()
-        prev_checkpoint_mean_ep_rew = self.best_mean_reward
-        num_improved_episodes_before_checkpoint = 0  # To keep track of the num of ep with higher perf to save model
-        #print("Using agent_params:", self.params)
-        if self.params['load_trained_model']:
-            try:
-                self.load()
-                prev_checkpoint_mean_ep_rew = self.best_mean_reward
-            except FileNotFoundError:
-                if args.test:  # Test a saved model
-                    print("FATAL: No saved model found. Cannot test. Press any key to train from scratch")
-                    input()
-                else:
-                    print("WARNING: No trained model found for this environment. Training from scratch.")
+        if self.actor_name == "global":
+
+            # Handle loading and saving of trained Agent's model
+            episode_rewards = list()
+            prev_checkpoint_mean_ep_rew = self.best_mean_reward
+            num_improved_episodes_before_checkpoint = 0  # To keep track of the num of ep with higher perf to save model
+            #print("Using agent_params:", self.params)
+            if self.params['load_trained_model']:
+                try:
+                    self.load()
+                    prev_checkpoint_mean_ep_rew = self.best_mean_reward
+                except FileNotFoundError:
+                    if args.test:  # Test a saved model
+                        print("FATAL: No saved model found. Cannot test. Press any key to train from scratch")
+                        input()
+                    else:
+                        print("WARNING: No trained model found for this environment. Training from scratch.")
+            self.actor.share_memory()
+            self.critic.share_memory()
+            # Initialize the global shared actor-critic parameters
+            self.shared_state["actor_state_dict"] = self.actor.cpu().state_dict()
+            self.shared_state["critic_state_dict"] = self.critic.cpu().state_dict()
 
         for episode in range(self.params["max_num_episodes"]):
             obs = self.env.reset()
             done = False
             ep_reward = 0.0
             step_num = 0
+            self.pull_params_from_global_agent()  # Synchronize local-agent specific parameters from the global
             while not done:
                 action = self.get_action(obs)
                 next_obs, reward, done, _ = self.env.step(action)
                 self.rewards.append(reward)
                 ep_reward += reward
-                step_num +=1
+                step_num += 1
                 if not args.test and (step_num >= self.params["learning_step_thresh"] or done):
                     self.learn(next_obs, done)
                     step_num = 0
+                    # Async send updates to the global shared parameters
+                    self.push_params_to_global_agent()
+
                     # Monitor performance and save Agent's state when perf improves
-                    if done:
+                    if done and self.actor_name == "global":
                         episode_rewards.append(ep_reward)
                         if ep_reward > self.best_reward:
                             self.best_reward = ep_reward
@@ -327,13 +356,16 @@ class DeepActorCriticAgent(mp.Process):
 
                 obs = next_obs
                 self.global_step_num += 1
-                if args.render:
-                    self.env.render()
-                #print(self.actor_name + ":Episode#:", episode, "step#:", step_num, "\t rew=", reward, end="\r")
-                writer.add_scalar(self.actor_name + "/reward", reward, self.global_step_num)
-            print("{}:Episode#:{} \t ep_reward:{} \t mean_ep_rew:{}\t best_ep_reward:{}".format(
-                self.actor_name, episode, ep_reward, np.mean(episode_rewards), self.best_reward))
-            writer.add_scalar(self.actor_name + "/ep_reward", ep_reward, self.global_step_num)
+                if self.actor_name == "global":
+                    if args.render:
+                        self.env.render()
+                    #print(self.actor_name + ":Episode#:", episode, "step#:", step_num, "\t rew=", reward, end="\r")
+                    writer.add_scalar(self.actor_name + "/reward", reward, self.global_step_num)
+            # Print stats at the end of episodes
+            if self.actor_name == "global":
+                print("{}:Episode#:{} \t ep_reward:{} \t mean_ep_rew:{}\t best_ep_reward:{}".format(
+                            self.actor_name, episode, ep_reward, np.mean(episode_rewards), self.best_reward))
+                writer.add_scalar(self.actor_name + "/ep_reward", ep_reward, self.global_step_num)
 
 
 if __name__ == "__main__":
@@ -344,7 +376,15 @@ if __name__ == "__main__":
     env_params["env_name"] = args.env
     mp.set_start_method('spawn')  # Prevents RuntimeError during cuda init
 
-    agent_procs =[DeepActorCriticAgent(id, args.env, agent_params, env_params)
-                  for id in range(agent_params["num_agents"])]
-    [p.start() for p in agent_procs]
-    [p.join() for p in agent_procs]
+    manager = mp.Manager()
+    shared_state = manager.dict()
+    if not args.test:
+        agent_procs =[DeepActorCriticAgent(id, args.env, agent_params, shared_state, env_params)
+                      for id in range(agent_params["num_agents"])]
+        [p.start() for p in agent_procs]
+        [p.join() for p in agent_procs]
+    else:
+        test_agent_proc = DeepActorCriticAgent(0, args.env, agent_params, shared_state, env_params)
+        test_agent_proc.start()
+        test_agent_proc.join()
+

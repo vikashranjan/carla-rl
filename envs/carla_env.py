@@ -1,9 +1,3 @@
-"""
-OpenAI Gym compatible Driving simulation environment based on Carla.
-Requires the system environment variable CARLA_SERVER to be defined and be pointing to the
-CarlaUE4.sh file on your system. The default path is assumed to be at: ~/software/CARLA_0.8.2/CarlaUE4.sh
-Chapter 7, Hands-on Intelligent Agents with OpenAI Gym, 2018| Praveen Palanisamy
-"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -22,25 +16,16 @@ import numpy as np
 import gym
 from gym.spaces import Box, Discrete, Tuple
 
+from carla.client import CarlaClient
+from carla.sensor import Camera
+from carla.settings import CarlaSettings
+from carla.planner.planner import Planner, REACH_GOAL, GO_STRAIGHT, TURN_RIGHT, TURN_LEFT, LANE_FOLLOW
+
 # Set this to the path to your Carla binary
 SERVER_BINARY = os.environ.get(
-    "CARLA_SERVER", os.path.expanduser("~/software/CARLA_0.8.2/CarlaUE4.sh"))
+    "CARLA_SERVER", os.path.expanduser("~/CARLA_0.8.2/CarlaUE4.sh"))
 assert os.path.exists(SERVER_BINARY), "CARLA_SERVER environment variable is not set properly. Please check and retry"
 
-
-# Import Carla python client API funcs
-try:
-    from carla.client import CarlaClient
-    from carla.sensor import Camera
-    from carla.settings import CarlaSettings
-    from carla.planner.planner import Planner, REACH_GOAL, GO_STRAIGHT, \
-        TURN_RIGHT, TURN_LEFT, LANE_FOLLOW
-except ImportError:
-    from .carla.client import CarlaClient
-    from .carla.sensor import Camera
-    from .carla.settings import CarlaSettings
-    from .carla.planner.planner import Planner, REACH_GOAL, GO_STRAIGHT, \
-        TURN_RIGHT, TURN_LEFT, LANE_FOLLOW
 
 # Carla planner commands
 COMMANDS_ENUM = {
