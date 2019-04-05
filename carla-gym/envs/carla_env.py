@@ -1,5 +1,8 @@
 """
 OpenAI Gym compatible Driving simulation environment based on Carla.
+Requires the system environment variable CARLA_SERVER to be defined and be pointing to the
+CarlaUE4.sh file on your system. The default path is assumed to be at: ~/software/CARLA_0.8.2/CarlaUE4.sh
+Chapter 7, Hands-on Intelligent Agents with OpenAI Gym, 2018| Praveen Palanisamy
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -19,574 +22,50 @@ import numpy as np
 import gym
 from gym.spaces import Box, Discrete, Tuple
 
-import carla
-
-from carla import ColorConverter as cc
-
-import argparse
-import collections
-
-import logging
-import math
-import random
-import re
-import weakref
-import pygame
-
-
-# ==============================================================================
-# -- Global functions ----------------------------------------------------------
-# ==============================================================================
-
-
-def find_weather_presets():
-    rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
-    name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
-    presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
-    return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]
-
-
-def get_actor_display_name(actor, truncate=250):
-    name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
-    return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
-
-
-# ==============================================================================
-# -- World ---------------------------------------------------------------------
-# ==============================================================================
-
-
-class World(object):
-    def __init__(self, carla_world, hud, actor_filter, number_of_vehicles):
-        self.world = carla_world
-        self.map = self.world.get_map()
-        self.hud = hud
-        self.player = None
-        self.collision_sensor = None
-        self.lane_invasion_sensor = None
-        self.gnss_sensor = None
-        self.camera_manager = None
-        self._weather_presets = find_weather_presets()
-        self._weather_index = 0
-        self._actor_filter = actor_filter
-
-        self.world.on_tick(hud.on_world_tick)
-        self.recording_enabled = False
-        self.recording_start = 0
-        self.number_of_vehicles = number_of_vehicles
-        self.restart()
-
-    def try_spawn_random_vehicle_at(self, transform, blueprint):
-        #blueprint = random.choice(blueprints)
-        if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
-        blueprint.set_attribute('role_name', 'autopilot')
-        vehicle = self.world.try_spawn_actor(blueprint, transform)
-        vehicle.set_autopilot(True)
-        #print('spawned %s at %s' % (str(vehicle.type_id), str(transform.location)))
-        return vehicle
-
-    def restart(self):
-        # Keep same camera config if the camera manager exists.
-        cam_index = self.camera_manager._index if self.camera_manager is not None else 0
-        cam_pos_index = self.camera_manager._transform_index if self.camera_manager is not None else 0
-        # Get a random blueprint.
-        blueprint = random.choice(self.world.get_blueprint_library().filter(self._actor_filter))
-        blueprint.set_attribute('role_name', 'hero')
-        if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
-
-        # Spawn actors
-        spawn_points = list(self.world.get_map().get_spawn_points())
-        random.shuffle(spawn_points)
-        count = self.number_of_vehicles
-        while count > 0:
-            time.sleep(2)
-            if self.try_spawn_random_vehicle_at(random.choice(spawn_points), blueprint):
-                count -= 1
-
-        # Spawn the player.
-        if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-        while self.player is None:
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-        # Set up the sensors.
-        self.collision_sensor = CollisionSensor(self.player, self.hud)
-        self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
-        self.gnss_sensor = GnssSensor(self.player)
-        self.camera_manager = CameraManager(self.player, self.hud)
-        self.camera_manager._transform_index = cam_pos_index
-        self.camera_manager.set_sensor(cam_index, notify=False)
-        actor_type = get_actor_display_name(self.player)
-        self.hud.notification(actor_type)
-
-    def next_weather(self, reverse=False):
-        self._weather_index += -1 if reverse else 1
-        self._weather_index %= len(self._weather_presets)
-        preset = self._weather_presets[self._weather_index]
-        self.hud.notification('Weather: %s' % preset[1])
-        self.player.get_world().set_weather(preset[0])
-
-    def tick(self, clock):
-        self.hud.tick(self, clock)
-
-    def render(self, display):
-        self.camera_manager.render(display)
-        self.hud.render(display)
-
-    def destroySensors(self):
-        self.camera_manager.sensor.destroy()
-        self.camera_manager.sensor = None
-        self.camera_manager._index = None
-
-    def destroy(self):
-        actors = [
-            self.camera_manager.sensor,
-            self.collision_sensor.sensor,
-            self.lane_invasion_sensor.sensor,
-            self.gnss_sensor.sensor,
-            self.player]
-        for actor in actors:
-            if actor is not None:
-                actor.destroy()
-
-
-# ==============================================================================
-# -- FadingText ----------------------------------------------------------------
-# ==============================================================================
-
-
-class FadingText(object):
-    def __init__(self, font, dim, pos):
-        self.font = font
-        self.dim = dim
-        self.pos = pos
-        self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-
-    def set_text(self, text, color=(255, 255, 255), seconds=2.0):
-        text_texture = self.font.render(text, True, color)
-        self.surface = pygame.Surface(self.dim)
-        self.seconds_left = seconds
-        self.surface.fill((0, 0, 0, 0))
-        self.surface.blit(text_texture, (10, 11))
-
-    def tick(self, _, clock):
-        delta_seconds = 1e-3 * clock.get_time()
-        self.seconds_left = max(0.0, self.seconds_left - delta_seconds)
-        self.surface.set_alpha(500.0 * self.seconds_left)
-
-    def render(self, display):
-        display.blit(self.surface, self.pos)
-
-
-# ==============================================================================
-# -- HelpText ------------------------------------------------------------------
-# ==============================================================================
-
-
-class HelpText(object):
-    def __init__(self, font, width, height):
-        lines = __doc__.split('\n')
-        self.font = font
-        self.dim = (680, len(lines) * 22 + 12)
-        self.pos = (0.5 * width - 0.5 * self.dim[0], 0.5 * height - 0.5 * self.dim[1])
-        self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-        self.surface.fill((0, 0, 0, 0))
-        for n, line in enumerate(lines):
-            text_texture = self.font.render(line, True, (255, 255, 255))
-            self.surface.blit(text_texture, (22, n * 22))
-            self._render = False
-        self.surface.set_alpha(220)
-
-    def toggle(self):
-        self._render = not self._render
-
-    def render(self, display):
-        if self._render:
-            display.blit(self.surface, self.pos)
-
-
-# ==============================================================================
-# -- HUD -----------------------------------------------------------------------
-# ==============================================================================
-
-
-class HUD(object):
-    def __init__(self, width, height):
-        self.dim = (width, height)
-        font = pygame.font.Font(pygame.font.get_default_font(), 20)
-        fonts = [x for x in pygame.font.get_fonts() if 'mono' in x]
-        default_font = 'ubuntumono'
-        mono = default_font if default_font in fonts else fonts[0]
-        mono = pygame.font.match_font(mono)
-        self._font_mono = pygame.font.Font(mono, 14)
-        self._notifications = FadingText(font, (width, 40), (0, height - 40))
-        self.help = HelpText(pygame.font.Font(mono, 24), width, height)
-        self.server_fps = 0
-        self.frame_number = 0
-        self.simulation_time = 0
-        self._show_info = True
-        self._info_text = []
-        self._server_clock = pygame.time.Clock()
-
-    def on_world_tick(self, timestamp):
-        self._server_clock.tick()
-        self.server_fps = self._server_clock.get_fps()
-        self.frame_number = timestamp.frame_count
-        self.simulation_time = timestamp.elapsed_seconds
-
-    def tick(self, world, clock):
-        self._notifications.tick(world, clock)
-        if not self._show_info:
-            return
-        t = world.player.get_transform()
-        v = world.player.get_velocity()
-        c = world.player.get_control()
-        heading = 'N' if abs(t.rotation.yaw) < 89.5 else ''
-        heading += 'S' if abs(t.rotation.yaw) > 90.5 else ''
-        heading += 'E' if 179.5 > t.rotation.yaw > 0.5 else ''
-        heading += 'W' if -0.5 > t.rotation.yaw > -179.5 else ''
-        colhist = world.collision_sensor.get_collision_history()
-        collision = [colhist[x + self.frame_number - 200] for x in range(0, 200)]
-        max_col = max(1.0, max(collision))
-        collision = [x / max_col for x in collision]
-        vehicles = world.world.get_actors().filter('vehicle.*')
-        self._info_text = [
-            'Server:  % 16.0f FPS' % self.server_fps,
-            'Client:  % 16.0f FPS' % clock.get_fps(),
-            '',
-            'Vehicle: % 20s' % get_actor_display_name(world.player, truncate=20),
-            'Map:     % 20s' % world.map.name,
-            'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
-            '',
-            'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)),
-            u'Heading:% 16.0f\N{DEGREE SIGN} % 2s' % (t.rotation.yaw, heading),
-            'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
-            'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
-            'Height:  % 18.0f m' % t.location.z,
-            '']
-        if isinstance(c, carla.VehicleControl):
-            self._info_text += [
-                ('Throttle:', c.throttle, 0.0, 1.0),
-                ('Steer:', c.steer, -1.0, 1.0),
-                ('Brake:', c.brake, 0.0, 1.0),
-                ('Reverse:', c.reverse),
-                ('Hand brake:', c.hand_brake),
-                ('Manual:', c.manual_gear_shift),
-                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
-        elif isinstance(c, carla.WalkerControl):
-            self._info_text += [
-                ('Speed:', c.speed, 0.0, 5.556),
-                ('Jump:', c.jump)]
-        self._info_text += [
-            '',
-            'Collision:',
-            collision,
-            '',
-            'Number of vehicles: % 8d' % len(vehicles)]
-        if len(vehicles) > 1:
-            self._info_text += ['Nearby vehicles:']
-            distance = lambda l: math.sqrt(
-                (l.x - t.location.x) ** 2 + (l.y - t.location.y) ** 2 + (l.z - t.location.z) ** 2)
-            vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.player.id]
-            for d, vehicle in sorted(vehicles):
-                if d > 200.0:
-                    break
-                vehicle_type = get_actor_display_name(vehicle, truncate=22)
-                self._info_text.append('% 4dm %s' % (d, vehicle_type))
-
-    def toggle_info(self):
-        self._show_info = not self._show_info
-
-    def notification(self, text, seconds=2.0):
-        self._notifications.set_text(text, seconds=seconds)
-
-    def error(self, text):
-        self._notifications.set_text('Error: %s' % text, (255, 0, 0))
-
-    def render(self, display):
-        if self._show_info:
-            info_surface = pygame.Surface((220, self.dim[1]))
-            info_surface.set_alpha(100)
-            display.blit(info_surface, (0, 0))
-            v_offset = 4
-            bar_h_offset = 100
-            bar_width = 106
-            for item in self._info_text:
-                if v_offset + 18 > self.dim[1]:
-                    break
-                if isinstance(item, list):
-                    if len(item) > 1:
-                        points = [(x + 8, v_offset + 8 + (1.0 - y) * 30) for x, y in enumerate(item)]
-                        pygame.draw.lines(display, (255, 136, 0), False, points, 2)
-                    item = None
-                    v_offset += 18
-                elif isinstance(item, tuple):
-                    if isinstance(item[1], bool):
-                        rect = pygame.Rect((bar_h_offset, v_offset + 8), (6, 6))
-                        pygame.draw.rect(display, (255, 255, 255), rect, 0 if item[1] else 1)
-                    else:
-                        rect_border = pygame.Rect((bar_h_offset, v_offset + 8), (bar_width, 6))
-                        pygame.draw.rect(display, (255, 255, 255), rect_border, 1)
-                        f = (item[1] - item[2]) / (item[3] - item[2])
-                        if item[2] < 0.0:
-                            rect = pygame.Rect((bar_h_offset + f * (bar_width - 6), v_offset + 8), (6, 6))
-                        else:
-                            rect = pygame.Rect((bar_h_offset, v_offset + 8), (f * bar_width, 6))
-                        pygame.draw.rect(display, (255, 255, 255), rect)
-                    item = item[0]
-                if item:  # At this point has to be a str.
-                    surface = self._font_mono.render(item, True, (255, 255, 255))
-                    display.blit(surface, (8, v_offset))
-                v_offset += 18
-        self._notifications.render(display)
-        self.help.render(display)
-
-
-# ==============================================================================
-# -- CollisionSensor -----------------------------------------------------------
-# ==============================================================================
-
-
-class CollisionSensor(object):
-    def __init__(self, parent_actor, hud):
-        self.sensor = None
-        self._history = []
-        self._parent = parent_actor
-        self._hud = hud
-        world = self._parent.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.collision')
-        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=self._parent)
-        # We need to pass the lambda a weak reference to self to avoid circular
-        # reference.
-        weak_self = weakref.ref(self)
-        self.sensor.listen(lambda event: CollisionSensor._on_collision(weak_self, event))
-
-    def get_collision_history(self):
-        history = collections.defaultdict(int)
-        for frame, intensity in self._history:
-            history[frame] += intensity
-        return history
-
-    @staticmethod
-    def _on_collision(weak_self, event):
-        self = weak_self()
-        if not self:
-            return
-        actor_type = get_actor_display_name(event.other_actor)
-        self._hud.notification('Collision with %r' % actor_type)
-        impulse = event.normal_impulse
-        intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
-        self._history.append((event.frame_number, intensity))
-        if len(self._history) > 4000:
-            self._history.pop(0)
-
-
-# ==============================================================================
-# -- LaneInvasionSensor --------------------------------------------------------
-# ==============================================================================
-
-
-class LaneInvasionSensor(object):
-    def __init__(self, parent_actor, hud):
-        self.sensor = None
-        self._parent = parent_actor
-        self._hud = hud
-        world = self._parent.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.lane_detector')
-        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=self._parent)
-        # We need to pass the lambda a weak reference to self to avoid circular
-        # reference.
-        weak_self = weakref.ref(self)
-        self.sensor.listen(lambda event: LaneInvasionSensor._on_invasion(weak_self, event))
-
-    @staticmethod
-    def _on_invasion(weak_self, event):
-        self = weak_self()
-        if not self:
-            return
-        text = ['%r' % str(x).split()[-1] for x in set(event.crossed_lane_markings)]
-        self._hud.notification('Crossed line %s' % ' and '.join(text))
-
-
-# ==============================================================================
-# -- GnssSensor --------------------------------------------------------
-# ==============================================================================
-
-
-class GnssSensor(object):
-    def __init__(self, parent_actor):
-        self.sensor = None
-        self._parent = parent_actor
-        self.lat = 0.0
-        self.lon = 0.0
-        world = self._parent.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.gnss')
-        self.sensor = world.spawn_actor(bp, carla.Transform(carla.Location(x=1.0, z=2.8)), attach_to=self._parent)
-        # We need to pass the lambda a weak reference to self to avoid circular
-        # reference.
-        weak_self = weakref.ref(self)
-        self.sensor.listen(lambda event: GnssSensor._on_gnss_event(weak_self, event))
-
-    @staticmethod
-    def _on_gnss_event(weak_self, event):
-        self = weak_self()
-        if not self:
-            return
-        self.lat = event.latitude
-        self.lon = event.longitude
-
-
-# ==============================================================================
-# -- CameraManager -------------------------------------------------------------
-# ==============================================================================
-
-
-class CameraManager(object):
-    def __init__(self, parent_actor, hud):
-        self.sensor = None
-        self._surface = None
-        self._parent = parent_actor
-        self._hud = hud
-        self._recording = False
-        self._camera_transforms = [
-            carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15)),
-            carla.Transform(carla.Location(x=1.6, z=1.7))]
-        self._transform_index = 1
-        self._sensors = [
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
-            ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)'],
-            ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)'],
-            ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)'],
-            ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
-            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
-             'Camera Semantic Segmentation (CityScapes Palette)'],
-            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)']]
-        world = self._parent.get_world()
-        bp_library = world.get_blueprint_library()
-        for item in self._sensors:
-            bp = bp_library.find(item[0])
-            if item[0].startswith('sensor.camera'):
-                bp.set_attribute('image_size_x', str(hud.dim[0]))
-                bp.set_attribute('image_size_y', str(hud.dim[1]))
-            elif item[0].startswith('sensor.lidar'):
-                bp.set_attribute('range', '5000')
-            item.append(bp)
-        self._index = None
-
-    def toggle_camera(self):
-        self._transform_index = (self._transform_index + 1) % len(self._camera_transforms)
-        self.sensor.set_transform(self._camera_transforms[self._transform_index])
-
-    def set_sensor(self, index, notify=True):
-        index = index % len(self._sensors)
-        needs_respawn = True if self._index is None \
-            else self._sensors[index][0] != self._sensors[self._index][0]
-        if needs_respawn:
-            if self.sensor is not None:
-                self.sensor.destroy()
-                self._surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self._sensors[index][-1],
-                self._camera_transforms[self._transform_index],
-                attach_to=self._parent)
-            # We need to pass the lambda a weak reference to self to avoid
-            # circular reference.
-            weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
-        if notify:
-            self._hud.notification(self._sensors[index][2])
-        self._index = index
-
-    def next_sensor(self):
-        self.set_sensor(self._index + 1)
-
-    def toggle_recording(self):
-        self._recording = not self._recording
-        self._hud.notification('Recording %s' % ('On' if self._recording else 'Off'))
-
-    def render(self, display):
-        if self._surface is not None:
-            display.blit(self._surface, (0, 0))
-
-    @staticmethod
-    def _parse_image(weak_self, image):
-        self = weak_self()
-        if not self:
-            return
-        if self._sensors[self._index][0].startswith('sensor.lidar'):
-            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
-            points = np.reshape(points, (int(points.shape[0] / 3), 3))
-            lidar_data = np.array(points[:, :2])
-            lidar_data *= min(self._hud.dim) / 100.0
-            lidar_data += (0.5 * self._hud.dim[0], 0.5 * self._hud.dim[1])
-            lidar_data = np.fabs(lidar_data)
-            lidar_data = lidar_data.astype(np.int32)
-            lidar_data = np.reshape(lidar_data, (-1, 2))
-            lidar_img_size = (self._hud.dim[0], self._hud.dim[1], 3)
-            lidar_img = np.zeros(lidar_img_size)
-            lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
-            self._surface = pygame.surfarray.make_surface(lidar_img)
-        else:
-            image.convert(self._sensors[self._index][1])
-            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            self._surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        if self._recording:
-            image.save_to_disk('_out/%08d' % image.frame_number)
-
-
-# ==============================================================================
-# -- Control -----------------------------------------------------------
-# ==============================================================================
-
-
-class CarlaControl(object):
-    def __init__(self, world):
-        self._control = carla.VehicleControl()
-        world.player.set_autopilot(True)
-
-    def _apply_vehicle_action(self, action):
-        self._control.throttle = float(np.clip(action[0], 0, 1))
-        self._control.steer = float(np.clip(action[1], -1, 1))
-        self._control.brake = float(np.abs(np.clip(action[0], -1, 0)))
-        self._control.hand_brake = False
-        self._control.reverse = False
-        return self._control
-
+# Set this to the path to your Carla binary
+SERVER_BINARY = os.environ.get(
+    "CARLA_SERVER", os.path.expanduser("~/software/CARLA_0.8.2/CarlaUE4.sh"))
+assert os.path.exists(SERVER_BINARY), "CARLA_SERVER environment variable is not set properly. Please check and retry"
+
+
+# Import Carla python client API funcs
+try:
+    from carla.client import CarlaClient
+    from carla.sensor import Camera
+    from carla.settings import CarlaSettings
+    from carla.planner.planner import Planner, REACH_GOAL, GO_STRAIGHT, \
+        TURN_RIGHT, TURN_LEFT, LANE_FOLLOW
+except ImportError:
+    from .carla.client import CarlaClient
+    from .carla.sensor import Camera
+    from .carla.settings import CarlaSettings
+    from .carla.planner.planner import Planner, REACH_GOAL, GO_STRAIGHT, \
+        TURN_RIGHT, TURN_LEFT, LANE_FOLLOW
+
+# Carla planner commands
+COMMANDS_ENUM = {
+    REACH_GOAL: "REACH_GOAL",
+    GO_STRAIGHT: "GO_STRAIGHT",
+    TURN_RIGHT: "TURN_RIGHT",
+    TURN_LEFT: "TURN_LEFT",
+    LANE_FOLLOW: "LANE_FOLLOW",
+}
+
+# Mapping from string repr to one-hot encoding index to feed to the model
+COMMAND_ORDINAL = {
+    "REACH_GOAL": 0,
+    "GO_STRAIGHT": 1,
+    "TURN_RIGHT": 2,
+    "TURN_LEFT": 3,
+    "LANE_FOLLOW": 4,
+}
 
 # Load scenario configuration parameters from scenarios.json
 __location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
 scenario_config = json.load(open(os.path.join(__location__, "scenarios.json")))
 city = scenario_config["city"][1]  # Town2
-weathers = [scenario_config['Weather']['WetNoon'], scenario_config['Weather']['ClearSunset']]
+weathers = [scenario_config['Weather']['WetNoon'], scenario_config['Weather']['ClearSunset'] ]
 scenario_config['Weather_distribution'] = weathers
-
-# Define the discrete action space
-DISCRETE_ACTIONS = {
-    0: [0.0, 0.0],  # Coast
-    1: [0.0, -0.5],  # Turn Left
-    2: [0.0, 0.5],  # Turn Right
-    3: [1.0, 0.0],  # Forward
-    4: [-0.5, 0.0],  # Brake
-    5: [1.0, -0.5],  # Bear Left & accelerate
-    6: [1.0, 0.5],  # Bear Right & accelerate
-    7: [-0.5, -0.5],  # Bear Left & decelerate
-    8: [-0.5, 0.5],  # Bear Right & decelerate
-}
 
 # Default environment configuration
 ENV_CONFIG = {
@@ -599,43 +78,38 @@ ENV_CONFIG = {
     "use_depth_camera": False,
     "early_terminate_on_collision": True,
     "verbose": False,
-    "render": True,  # Render to display if true
+    "render" : True,  # Render to display if true
     "render_x_res": 800,
     "render_y_res": 600,
     "x_res": 80,
     "y_res": 80,
-    "seed": 1,
-    "server_host": "localhost",
-    "server_port": 2000,
-    "server_timeout": 2,
-    "filter": "vehicle.*"
+    "seed": 1
 }
+
+# Number of retries if the server doesn't respond
 RETRIES_ON_ERROR = 4
-
-REACH_GOAL = 0
-GO_STRAIGHT = 1
-TURN_RIGHT = 2
-TURN_LEFT = 3
-LANE_FOLLOW = 4
-
-# Carla planner commands
-COMMANDS_ENUM = {
-    REACH_GOAL: "REACH_GOAL",
-    GO_STRAIGHT: "GO_STRAIGHT",
-    TURN_RIGHT: "TURN_RIGHT",
-    TURN_LEFT: "TURN_LEFT",
-    LANE_FOLLOW: "LANE_FOLLOW",
-}
-
-COMMAND_ORDINAL = {
-    "REACH_GOAL": 0,
-    "GO_STRAIGHT": 1,
-    "TURN_RIGHT": 2,
-    "TURN_LEFT": 3,
-    "LANE_FOLLOW": 4,
-}
-
+# Dummy Z coordinate to use when we only care about (x, y)
 GROUND_Z = 22
+
+# Define the discrete action space
+DISCRETE_ACTIONS = {
+    0: [0.0, 0.0],    # Coast
+    1: [0.0, -0.5],   # Turn Left
+    2: [0.0, 0.5],    # Turn Right
+    3: [1.0, 0.0],    # Forward
+    4: [-0.5, 0.0],   # Brake
+    5: [1.0, -0.5],   # Bear Left & accelerate
+    6: [1.0, 0.5],    # Bear Right & accelerate
+    7: [-0.5, -0.5],  # Bear Left & decelerate
+    8: [-0.5, 0.5],   # Bear Right & decelerate
+}
+
+live_carla_processes = set()  # To keep track of all the Carla processes we launch to make the cleanup easier
+def cleanup():
+    print("Killing live carla processes", live_carla_processes)
+    for pgid in live_carla_processes:
+        os.killpg(pgid, signal.SIGKILL)
+atexit.register(cleanup)
 
 
 class CarlaEnv(gym.Env):
@@ -645,50 +119,10 @@ class CarlaEnv(gym.Env):
         Carla driving simulator.
         :param config: A dictionary with environment configuration keys and values
         """
-        self.server_port = None
-        self.client = None
-        self.num_steps = 0
-        self.total_reward = 0
-        self.prev_measurement = None
-        self.prev_image = None
-        self.episode_id = None
-        self.measurements_file = None
-        self.weather = None
-        self.scenario = None
-        self.start_pos = None
-        self.end_pos = None
-        self.start_coord = None
-        self.end_coord = None
-        self.last_obs = None
-
         self.config = config
-
-        pygame.init()
-        pygame.font.init()
-
-        client = carla.Client(config["server_host"], config["server_port"])
-        client.set_timeout(config["server_timeout"])
-
-        # display = pygame.display.set_mode(
-        #     ((config["render_x_res"], (config["render_y_res"]),
-        #       pygame.HWSURFACE | pygame.DOUBLEBUF)))
-
-        hud = HUD(config["render_x_res"], (config["render_y_res"]))
-        world = World(client.get_world(), hud, config["filter"],20)
-        controller = CarlaControl(world)
-
-        clock = pygame.time.Clock()
-
-        self.client = client
-        #self.display = display
-        self.hud = hud
-        self.world = world
-        self.controller = controller
-        self.clock = clock
-
-        self.control = CarlaControl(world)
-
         self.city = self.config["server_map"].split("/")[-1]
+        if self.config["enable_planner"]:
+            self.planner = Planner(self.city)
 
         if config["discrete_actions"]:
             self.action_space = Discrete(len(DISCRETE_ACTIONS))
@@ -712,13 +146,84 @@ class CarlaEnv(gym.Env):
                  Discrete(len(COMMANDS_ENUM)),  # next_command
                  Box(-128.0, 128.0, shape=(2,), dtype=np.float32)])  # forward_speed, dist to goal
 
+        self._spec = lambda: None
+        self._spec.id = "Carla-v0"
+        self._seed = ENV_CONFIG["seed"]
+
+        self.server_port = None
+        self.server_process = None
+        self.client = None
+        self.num_steps = 0
+        self.total_reward = 0
+        self.prev_measurement = None
+        self.prev_image = None
+        self.episode_id = None
+        self.measurements_file = None
+        self.weather = None
+        self.scenario = None
+        self.start_pos = None
+        self.end_pos = None
+        self.start_coord = None
+        self.end_coord = None
+        self.last_obs = None
+
+    def init_server(self):
+        print("Initializing new Carla server...")
+        # Create a new server process and start the client.
+        self.server_port = random.randint(10000, 60000)
+        if self.config["render"]:
+            self.server_process = subprocess.Popen(
+                [SERVER_BINARY, self.config["server_map"],
+                 "-windowed", "-ResX=400", "-ResY=300",
+                 "-carla-server",
+                 "-carla-world-port={}".format(self.server_port)],
+                preexec_fn=os.setsid, stdout=open(os.devnull, "w"))
+        else:
+            self.server_process = subprocess.Popen(
+                ("SDL_VIDEODRIVER=offscreen SDL_HINT_CUDA_DEVICE={} {} " +
+                 self.config["server_map"] + " -windowed -ResX=400 -ResY=300"
+                 " -carla-server -carla-world-port={}").format(0, SERVER_BINARY, self.server_port),
+                shell=True, preexec_fn=os.setsid, stdout=open(os.devnull, "w"))
+
+        live_carla_processes.add(os.getpgid(self.server_process.pid))
+
+        for i in range(RETRIES_ON_ERROR):
+            try:
+                self.client = CarlaClient("localhost", self.server_port)
+                return self.client.connect()
+            except Exception as e:
+                print("Error connecting: {}, attempt {}".format(e, i))
+                time.sleep(2)
+
+    def clear_server_state(self):
+        print("Clearing Carla server state")
+        try:
+            if self.client:
+                self.client.disconnect()
+                self.client = None
+        except Exception as e:
+            print("Error disconnecting client: {}".format(e))
+            pass
+        if self.server_process:
+            pgid = os.getpgid(self.server_process.pid)
+            os.killpg(pgid, signal.SIGKILL)
+            live_carla_processes.remove(pgid)
+            self.server_port = None
+            self.server_process = None
+
+    def __del__(self):
+        self.clear_server_state()
+
     def reset(self):
         error = None
         for _ in range(RETRIES_ON_ERROR):
             try:
-                self.reset_env()
+                if not self.server_process:
+                    self.init_server()
+                return self.reset_env()
             except Exception as e:
                 print("Error during reset: {}".format(traceback.format_exc()))
+                self.clear_server_state()
                 error = e
         raise error
 
@@ -729,27 +234,58 @@ class CarlaEnv(gym.Env):
         self.prev_image = None
         self.episode_id = datetime.today().strftime("%Y-%m-%d_%H-%M-%S_%f")
         self.measurements_file = None
-        self.world.restart()
 
-        # # Setup start and end positions
-        #scene = self.client.load_settings(settings)
-        # positions = scene.player_start_spots
-        # self.start_pos = positions[self.scenario["start_pos_id"]]
-        # self.end_pos = positions[self.scenario["end_pos_id"]]
-        # self.start_coord = [
-        #     self.start_pos.location.x // 100, self.start_pos.location.y // 100]
-        # self.end_coord = [
-        #     self.end_pos.location.x // 100, self.end_pos.location.y // 100]
-        # print(
-        #     "Start pos {} ({}), end {} ({})".format(
-        #         self.scenario["start_pos_id"], self.start_coord,
-        #         self.scenario["end_pos_id"], self.end_coord))
-        #
-        # # Notify the server that we want to start the episode at the
-        # # player_start index. This function blocks until the server is ready
-        # # to start the episode.
-        # print("Starting new episode...")
-        # self.client.start_episode(self.scenario["start_pos_id"])
+        # Create a CarlaSettings object. This object is a wrapper around
+        # the CarlaSettings.ini file. Here we set the configuration we
+        # want for the new episode.
+        settings = CarlaSettings()
+        # If config["scenarios"] is a single scenario, then use it if it's an array of scenarios, randomly choose one and init
+        if isinstance(self.config["scenarios"],dict):
+            self.scenario = self.config["scenarios"]
+        else: #isinstance array of dict
+            self.scenario = random.choice(self.config["scenarios"])
+        assert self.scenario["city"] == self.city, (self.scenario, self.city)
+        self.weather = random.choice(self.scenario["weather_distribution"])
+        settings.set(
+            SynchronousMode=True,
+            SendNonPlayerAgentsInfo=True,
+            NumberOfVehicles=self.scenario["num_vehicles"],
+            NumberOfPedestrians=self.scenario["num_pedestrians"],
+            WeatherId=self.weather)
+        settings.randomize_seeds()
+
+        if self.config["use_depth_camera"]:
+            camera1 = Camera("CameraDepth", PostProcessing="Depth")
+            camera1.set_image_size(
+                self.config["render_x_res"], self.config["render_y_res"])
+            camera1.set_position(30, 0, 130)
+            settings.add_sensor(camera1)
+
+        camera2 = Camera("CameraRGB")
+        camera2.set_image_size(
+            self.config["render_x_res"], self.config["render_y_res"])
+        camera2.set_position(30, 0, 130)
+        settings.add_sensor(camera2)
+
+        # Setup start and end positions
+        scene = self.client.load_settings(settings)
+        positions = scene.player_start_spots
+        self.start_pos = positions[self.scenario["start_pos_id"]]
+        self.end_pos = positions[self.scenario["end_pos_id"]]
+        self.start_coord = [
+            self.start_pos.location.x // 100, self.start_pos.location.y // 100]
+        self.end_coord = [
+            self.end_pos.location.x // 100, self.end_pos.location.y // 100]
+        print(
+            "Start pos {} ({}), end {} ({})".format(
+                self.scenario["start_pos_id"], self.start_coord,
+                self.scenario["end_pos_id"], self.end_coord))
+
+        # Notify the server that we want to start the episode at the
+        # player_start index. This function blocks until the server is ready
+        # to start the episode.
+        print("Starting new episode...")
+        self.client.start_episode(self.scenario["start_pos_id"])
 
         image, py_measurements = self._read_observation()
         self.prev_measurement = py_measurements
@@ -782,15 +318,27 @@ class CarlaEnv(gym.Env):
             print(
                 "Error during step, terminating episode early",
                 traceback.format_exc())
-
-            return self.last_obs, 0.0, True, {}
+            self.clear_server_state()
+            return (self.last_obs, 0.0, True, {})
 
     def step_env(self, action):
         if self.config["discrete_actions"]:
             action = DISCRETE_ACTIONS[int(action)]
         assert len(action) == 2, "Invalid action {}".format(action)
+        throttle = float(np.clip(action[0], 0, 1))
+        brake = float(np.abs(np.clip(action[0], -1, 0)))
+        steer = float(np.clip(action[1], -1, 1))
+        reverse = False
+        hand_brake = False
 
-        control = self.control._apply_vehicle_action(action)
+        if self.config["verbose"]:
+            print(
+                "steer", steer, "throttle", throttle, "brake", brake,
+                "reverse", reverse)
+
+        self.client.send_control(
+            steer=steer, throttle=throttle, brake=brake, hand_brake=hand_brake,
+            reverse=reverse)
 
         # Process observations
         image, py_measurements = self._read_observation()
@@ -801,11 +349,11 @@ class CarlaEnv(gym.Env):
         else:
             py_measurements["action"] = action
         py_measurements["control"] = {
-            "steer": control.steer,
-            "throttle": control.throttle,
-            "brake": control.brake,
-            "reverse": control.reverse,
-            "hand_brake": control.hand_brake,
+            "steer": steer,
+            "throttle": throttle,
+            "brake": brake,
+            "reverse": reverse,
+            "hand_brake": hand_brake,
         }
         reward = self.calculate_reward(py_measurements)
         self.total_reward += reward
@@ -823,6 +371,7 @@ class CarlaEnv(gym.Env):
         return (
             self.encode_obs(image, py_measurements), reward, done,
             py_measurements)
+
 
     def preprocess_image(self, image):
         if self.config["use_depth_camera"]:
@@ -922,6 +471,7 @@ class CarlaEnv(gym.Env):
             "next_command": next_command,
         }
 
+
         assert observation is not None, sensor_data
         return observation, py_measurements
 
@@ -948,20 +498,19 @@ class CarlaEnv(gym.Env):
 
         # New collision damage
         reward -= .00002 * (
-                current_measurement["collision_vehicles"] + current_measurement["collision_pedestrians"] +
-                current_measurement["collision_other"] - self.prev_measurement["collision_vehicles"] -
-                self.prev_measurement["collision_pedestrians"] - self.prev_measurement["collision_other"])
+            current_measurement["collision_vehicles"] + current_measurement["collision_pedestrians"] +
+            current_measurement["collision_other"] - self.prev_measurement["collision_vehicles"] -
+            self.prev_measurement["collision_pedestrians"] - self.prev_measurement["collision_other"])
 
         # New sidewalk intersection
         reward -= 2 * (
-                current_measurement["intersection_offroad"] - self.prev_measurement["intersection_offroad"])
+            current_measurement["intersection_offroad"] - self.prev_measurement["intersection_offroad"])
 
         # New opposite lane intersection
         reward -= 2 * (
-                current_measurement["intersection_otherlane"] - self.prev_measurement["intersection_otherlane"])
+            current_measurement["intersection_otherlane"] - self.prev_measurement["intersection_otherlane"])
 
         return reward
-
 
 def print_measurements(measurements):
     number_of_agents = len(measurements.non_player_agents)
@@ -988,8 +537,8 @@ def print_measurements(measurements):
 def check_collision(py_measurements):
     m = py_measurements
     collided = (
-            m["collision_vehicles"] > 0 or m["collision_pedestrians"] > 0 or
-            m["collision_other"] > 0)
+        m["collision_vehicles"] > 0 or m["collision_pedestrians"] > 0 or
+        m["collision_other"] > 0)
     return bool(collided or m["total_reward"] < -100)
 
 
