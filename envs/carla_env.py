@@ -159,14 +159,14 @@ class CarlaEnv(gym.Env):
         if self.config["render"]:
             self.server_process = subprocess.Popen(
                 [SERVER_BINARY, self.config["server_map"],
-                 "-windowed", "-ResX=400", "-ResY=300",
+                 "-windowed", "-ResX=1024", "-ResY=768",
                  "-carla-server",
                  "-carla-world-port={}".format(self.server_port)],
                 preexec_fn=os.setsid, stdout=open(os.devnull, "w"))
         else:
             self.server_process = subprocess.Popen(
                 ("SDL_VIDEODRIVER=offscreen SDL_HINT_CUDA_DEVICE={} {} " +
-                 self.config["server_map"] + " -windowed -ResX=400 -ResY=300"
+                 self.config["server_map"] + " -windowed -ResX=1024 -ResY=768"
                  " -carla-server -carla-world-port={}").format(0, SERVER_BINARY, self.server_port),
                 shell=True, preexec_fn=os.setsid, stdout=open(os.devnull, "w"))
 
