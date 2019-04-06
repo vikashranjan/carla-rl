@@ -8,6 +8,7 @@ from torch.distributions.categorical import Categorical
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import gym
+
 try:
     import roboschool
 except ImportError:
@@ -21,8 +22,12 @@ from function_approximator.shallow import Critic as ShallowCritic
 from function_approximator.deep import Actor as DeepActor
 from function_approximator.deep import DiscreteActor as DeepDiscreteActor
 from function_approximator.deep import Critic as DeepCritic
-from environment import carla_gym
 import utils.atari as Atari
+from gym.envs.registration import register
+register(
+    id='Carla-v0',
+    entry_point='envs.carla_env:CarlaEnv',
+)
 
 parser = ArgumentParser("deep_ac_agent")
 parser.add_argument("--env", help="Name of the Gym environment",
@@ -41,9 +46,9 @@ parser.add_argument("--gpu-id", type=int, default=0, metavar="GPU_ID",
 args = parser.parse_args()
 
 global_step_num = 0
-params_manager= ParamsManager(args.params_file)
+params_manager = ParamsManager(args.params_file)
 summary_file_path_prefix = params_manager.get_agent_params()['summary_file_path_prefix']
-summary_file_path= summary_file_path_prefix + args.env + "_" + datetime.now().strftime("%y-%m-%d-%H-%M")
+summary_file_path = summary_file_path_prefix + args.env + "_" + datetime.now().strftime("%y-%m-%d-%H-%M")
 writer = SummaryWriter(summary_file_path)
 # Export the parameters as json files to the log directory to keep track of the parameters used in each experiment
 params_manager.export_env_params(summary_file_path + "/" + "env_params.json")
@@ -59,6 +64,7 @@ if torch.cuda.is_available() and use_cuda:
     torch.cuda.manual_seed_all(seed)
 
 Transition = namedtuple("Transition", ["s", "value_s", "a", "log_prob_a"])
+
 
 class DeepActorCriticAgent(mp.Process):
     def __init__(self, id, env_name, agent_params, env_params):
@@ -77,12 +83,12 @@ class DeepActorCriticAgent(mp.Process):
         self.policy = self.multi_variate_gaussian_policy
         self.gamma = self.params['gamma']
         self.trajectory = []  # Contains the trajectory of the agent as a sequence of Transitions
-        self.rewards = []  #  Contains the rewards obtained from the env at every step
+        self.rewards = []  # Contains the rewards obtained from the env at every step
         self.global_step_num = 0
-        self.best_mean_reward = - float("inf") # Agent's personal best mean episode reward
+        self.best_mean_reward = - float("inf")  # Agent's personal best mean episode reward
         self.best_reward = - float("inf")
         self.saved_params = False  # Whether or not the params have been saved along with the model to model_dir
-        self.continuous_action_space = True  #Assumption by default unless env.action_space is Discrete
+        self.continuous_action_space = True  # Assumption by default unless env.action_space is Discrete
 
     def multi_variate_gaussian_policy(self, obs):
         """
@@ -92,16 +98,17 @@ class DeepActorCriticAgent(mp.Process):
         """
         mu, sigma = self.actor(obs)
         value = self.critic(obs)
-        [ mu[:, i].clamp_(float(self.env.action_space.low[i]), float(self.env.action_space.high[i]))
+        [mu[:, i].clamp_(float(self.env.action_space.low[i]), float(self.env.action_space.high[i]))
          for i in range(self.action_shape)]  # Clamp each dim of mu based on the (low,high) limits of that action dim
         sigma = torch.nn.Softplus()(sigma).squeeze() + 1e-7  # Let sigma be (smoothly) +ve
         self.mu = mu.to(torch.device("cpu"))
         self.sigma = sigma.to(torch.device("cpu"))
         self.value = value.to(torch.device("cpu"))
-        if len(self.mu.shape) == 0: # See if mu is a scalar
-            #self.mu = self.mu.unsqueeze(0)  # This prevents MultivariateNormal from crashing with SIGFPE
+        if len(self.mu.shape) == 0:  # See if mu is a scalar
+            # self.mu = self.mu.unsqueeze(0)  # This prevents MultivariateNormal from crashing with SIGFPE
             self.mu.unsqueeze_(0)
-        self.action_distribution = MultivariateNormal(self.mu, torch.eye(self.action_shape) * self.sigma, validate_args=True)
+        self.action_distribution = MultivariateNormal(self.mu, torch.eye(self.action_shape) * self.sigma,
+                                                      validate_args=True)
         return self.action_distribution
 
     def discrete_policy(self, obs):
@@ -176,7 +183,7 @@ class DeepActorCriticAgent(mp.Process):
             td_err = td_target - critic_prediction
             actor_losses.append(- log_p_a * td_err)  # td_err is an unbiased estimated of Advantage
             critic_losses.append(F.smooth_l1_loss(critic_prediction, td_target))
-            #critic_loss.append(F.mse_loss(critic_pred, td_target))
+            # critic_loss.append(F.mse_loss(critic_pred, td_target))
         if self.params["use_entropy_bonus"]:
             actor_loss = torch.stack(actor_losses).mean() - self.action_distribution.entropy().mean()
         else:
@@ -221,7 +228,7 @@ class DeepActorCriticAgent(mp.Process):
 
     def load(self):
         model_file_name = self.params["model_dir"] + "A2C_" + self.env_name + ".ptm"
-        agent_state = torch.load(model_file_name, map_location= lambda storage, loc: storage)
+        agent_state = torch.load(model_file_name, map_location=lambda storage, loc: storage)
         self.actor.load_state_dict(agent_state["Actor"])
         self.critic.load_state_dict(agent_state["Critic"])
         self.actor.to(device)
@@ -250,7 +257,7 @@ class DeepActorCriticAgent(mp.Process):
         if atari_env:  # Use the Atari wrappers (like we did in Chapter 6) if it's an Atari env
             self.env = Atari.make_env(self.env_name, self.env_conf)
         else:
-            #print("Given environment name is not an Atari Env. Creating a Gym env")
+            # print("Given environment name is not an Atari Env. Creating a Gym env")
             self.env = gym.make(self.env_name)
 
         self.state_shape = self.env.observation_space.shape
@@ -265,13 +272,13 @@ class DeepActorCriticAgent(mp.Process):
         self.critic_shape = 1
         if len(self.state_shape) == 3:  # Screen image is the input to the agent
             if self.continuous_action_space:
-                self.actor= DeepActor(self.state_shape, self.action_shape, device).to(device)
+                self.actor = DeepActor(self.state_shape, self.action_shape, device).to(device)
             else:  # Discrete action space
                 self.actor = DeepDiscreteActor(self.state_shape, self.action_shape, device).to(device)
             self.critic = DeepCritic(self.state_shape, self.critic_shape, device).to(device)
         else:  # Input is a (single dimensional) vector
             if self.continuous_action_space:
-                #self.actor_critic = ShallowActorCritic(self.state_shape, self.action_shape, 1, self.params).to(device)
+                # self.actor_critic = ShallowActorCritic(self.state_shape, self.action_shape, 1, self.params).to(device)
                 self.actor = ShallowActor(self.state_shape, self.action_shape, device).to(device)
             else:  # Discrete action space
                 self.actor = ShallowDiscreteActor(self.state_shape, self.action_shape, device).to(device)
@@ -283,7 +290,7 @@ class DeepActorCriticAgent(mp.Process):
         episode_rewards = list()
         prev_checkpoint_mean_ep_rew = self.best_mean_reward
         num_improved_episodes_before_checkpoint = 0  # To keep track of the num of ep with higher perf to save model
-        #print("Using agent_params:", self.params)
+        # print("Using agent_params:", self.params)
         if self.params['load_trained_model']:
             try:
                 self.load()
@@ -305,7 +312,7 @@ class DeepActorCriticAgent(mp.Process):
                 next_obs, reward, done, _ = self.env.step(action)
                 self.rewards.append(reward)
                 ep_reward += reward
-                step_num +=1
+                step_num += 1
                 if not args.test and (step_num >= self.params["learning_step_thresh"] or done):
                     self.learn(next_obs, done)
                     step_num = 0
@@ -326,7 +333,7 @@ class DeepActorCriticAgent(mp.Process):
                 self.global_step_num += 1
                 if args.render:
                     self.env.render()
-                #print(self.actor_name + ":Episode#:", episode, "step#:", step_num, "\t rew=", reward, end="\r")
+                # print(self.actor_name + ":Episode#:", episode, "step#:", step_num, "\t rew=", reward, end="\r")
                 writer.add_scalar(self.actor_name + "/reward", reward, self.global_step_num)
             print("{}:Episode#:{} \t ep_reward:{} \t mean_ep_rew:{}\t best_ep_reward:{}".format(
                 self.actor_name, episode, ep_reward, np.mean(episode_rewards), self.best_reward))
@@ -341,7 +348,7 @@ if __name__ == "__main__":
     env_params["env_name"] = args.env
     mp.set_start_method('spawn')  # Prevents RuntimeError during cuda init
 
-    agent_procs =[DeepActorCriticAgent(id, args.env, agent_params, env_params)
-                  for id in range(agent_params["num_agents"])]
+    agent_procs = [DeepActorCriticAgent(id, args.env, agent_params, env_params)
+                   for id in range(agent_params["num_agents"])]
     [p.start() for p in agent_procs]
     [p.join() for p in agent_procs]

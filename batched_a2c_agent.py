@@ -20,7 +20,11 @@ from function_approximator.shallow import Critic as ShallowCritic
 from function_approximator.deep import Actor as DeepActor
 from function_approximator.deep import DiscreteActor as DeepDiscreteActor
 from function_approximator.deep import Critic as DeepCritic
-from environment import carla_gym
+from gym.envs.registration import register
+register(
+    id='Carla-v0',
+    entry_point='envs.carla_env:CarlaEnv',
+)
 
 parser = ArgumentParser("deep_ac_agent")
 parser.add_argument("--env", help="Name of the Gym environment", default="CarRacing-v0", metavar="ENV_ID")
