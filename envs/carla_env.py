@@ -26,6 +26,7 @@ SERVER_BINARY = os.environ.get(
     "CARLA_SERVER", os.path.expanduser("~/CARLA_0.8.2/CarlaUE4.sh"))
 assert os.path.exists(SERVER_BINARY), "CARLA_SERVER environment variable is not set properly. Please check and retry"
 
+out_filename_format = '_out/episode_{}/{}/{}'
 
 # Carla planner commands
 COMMANDS_ENUM = {
@@ -49,7 +50,7 @@ COMMAND_ORDINAL = {
 __location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
 scenario_config = json.load(open(os.path.join(__location__, "scenarios.json")))
 city = scenario_config["city"][1]  # Town2
-weathers = [scenario_config['Weather']['WetNoon'], scenario_config['Weather']['ClearSunset'] ]
+weathers = [scenario_config['Weather']['WetNoon'], scenario_config['Weather']['ClearSunset']]
 scenario_config['Weather_distribution'] = weathers
 
 # Default environment configuration
@@ -63,12 +64,13 @@ ENV_CONFIG = {
     "use_depth_camera": False,
     "early_terminate_on_collision": True,
     "verbose": False,
-    "render" : True,  # Render to display if true
+    "render": True,  # Render to display if true
     "render_x_res": 800,
     "render_y_res": 600,
     "x_res": 80,
     "y_res": 80,
-    "seed": 1
+    "seed": 1,
+    "save_to_disk": True
 }
 
 # Number of retries if the server doesn't respond
@@ -78,22 +80,26 @@ GROUND_Z = 22
 
 # Define the discrete action space
 DISCRETE_ACTIONS = {
-    0: [0.0, 0.0],    # Coast
-    1: [0.0, -0.5],   # Turn Left
-    2: [0.0, 0.5],    # Turn Right
-    3: [1.0, 0.0],    # Forward
-    4: [-0.5, 0.0],   # Brake
-    5: [1.0, -0.5],   # Bear Left & accelerate
-    6: [1.0, 0.5],    # Bear Right & accelerate
+    0: [0.0, 0.0],  # Coast
+    1: [0.0, -0.5],  # Turn Left
+    2: [0.0, 0.5],  # Turn Right
+    3: [1.0, 0.0],  # Forward
+    4: [-0.5, 0.0],  # Brake
+    5: [1.0, -0.5],  # Bear Left & accelerate
+    6: [1.0, 0.5],  # Bear Right & accelerate
     7: [-0.5, -0.5],  # Bear Left & decelerate
-    8: [-0.5, 0.5],   # Bear Right & decelerate
+    8: [-0.5, 0.5],  # Bear Right & decelerate
 }
 
 live_carla_processes = set()  # To keep track of all the Carla processes we launch to make the cleanup easier
+
+
 def cleanup():
     print("Killing live carla processes", live_carla_processes)
     for pgid in live_carla_processes:
         os.killpg(pgid, signal.SIGKILL)
+
+
 atexit.register(cleanup)
 
 
@@ -167,7 +173,8 @@ class CarlaEnv(gym.Env):
             self.server_process = subprocess.Popen(
                 ("SDL_VIDEODRIVER=offscreen SDL_HINT_CUDA_DEVICE={} {} " +
                  self.config["server_map"] + " -windowed -ResX=1024 -ResY=768"
-                 " -carla-server -carla-world-port={}").format(0, SERVER_BINARY, self.server_port),
+                                             " -carla-server -carla-world-port={}").format(0, SERVER_BINARY,
+                                                                                           self.server_port),
                 shell=True, preexec_fn=os.setsid, stdout=open(os.devnull, "w"))
 
         live_carla_processes.add(os.getpgid(self.server_process.pid))
@@ -225,9 +232,9 @@ class CarlaEnv(gym.Env):
         # want for the new episode.
         settings = CarlaSettings()
         # If config["scenarios"] is a single scenario, then use it if it's an array of scenarios, randomly choose one and init
-        if isinstance(self.config["scenarios"],dict):
+        if isinstance(self.config["scenarios"], dict):
             self.scenario = self.config["scenarios"]
-        else: #isinstance array of dict
+        else:  # isinstance array of dict
             self.scenario = random.choice(self.config["scenarios"])
         assert self.scenario["city"] == self.city, (self.scenario, self.city)
         self.weather = random.choice(self.scenario["weather_distribution"])
@@ -250,6 +257,7 @@ class CarlaEnv(gym.Env):
         camera2.set_image_size(
             self.config["render_x_res"], self.config["render_y_res"])
         camera2.set_position(30, 0, 130)
+
         settings.add_sensor(camera2)
 
         # Setup start and end positions
@@ -357,7 +365,6 @@ class CarlaEnv(gym.Env):
             self.encode_obs(image, py_measurements), reward, done,
             py_measurements)
 
-
     def preprocess_image(self, image):
         if self.config["use_depth_camera"]:
             assert self.config["use_depth_camera"]
@@ -380,6 +387,12 @@ class CarlaEnv(gym.Env):
     def _read_observation(self):
         # Read the data produced by the server this frame.
         measurements, sensor_data = self.client.read_data()
+
+        #if save to disk
+        if self.config["save_to_disk"]:
+            for name, measurement in sensor_data.items():
+                filename = out_filename_format.format(self.episode_id, name, self.num_steps)
+                measurement.save_to_disk(filename)
 
         # Print some of the measurements.
         if self.config["verbose"]:
@@ -456,7 +469,6 @@ class CarlaEnv(gym.Env):
             "next_command": next_command,
         }
 
-
         assert observation is not None, sensor_data
         return observation, py_measurements
 
@@ -483,19 +495,20 @@ class CarlaEnv(gym.Env):
 
         # New collision damage
         reward -= .00002 * (
-            current_measurement["collision_vehicles"] + current_measurement["collision_pedestrians"] +
-            current_measurement["collision_other"] - self.prev_measurement["collision_vehicles"] -
-            self.prev_measurement["collision_pedestrians"] - self.prev_measurement["collision_other"])
+                current_measurement["collision_vehicles"] + current_measurement["collision_pedestrians"] +
+                current_measurement["collision_other"] - self.prev_measurement["collision_vehicles"] -
+                self.prev_measurement["collision_pedestrians"] - self.prev_measurement["collision_other"])
 
         # New sidewalk intersection
         reward -= 2 * (
-            current_measurement["intersection_offroad"] - self.prev_measurement["intersection_offroad"])
+                current_measurement["intersection_offroad"] - self.prev_measurement["intersection_offroad"])
 
         # New opposite lane intersection
         reward -= 2 * (
-            current_measurement["intersection_otherlane"] - self.prev_measurement["intersection_otherlane"])
+                current_measurement["intersection_otherlane"] - self.prev_measurement["intersection_otherlane"])
 
         return reward
+
 
 def print_measurements(measurements):
     number_of_agents = len(measurements.non_player_agents)
@@ -522,8 +535,8 @@ def print_measurements(measurements):
 def check_collision(py_measurements):
     m = py_measurements
     collided = (
-        m["collision_vehicles"] > 0 or m["collision_pedestrians"] > 0 or
-        m["collision_other"] > 0)
+            m["collision_vehicles"] > 0 or m["collision_pedestrians"] > 0 or
+            m["collision_other"] > 0)
     return bool(collided or m["total_reward"] < -100)
 
 
