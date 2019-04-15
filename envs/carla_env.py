@@ -70,7 +70,7 @@ ENV_CONFIG = {
     "x_res": 80,
     "y_res": 80,
     "seed": 1,
-    "save_to_disk": True
+    "save_to_disk": False
 }
 
 # Number of retries if the server doesn't respond
@@ -250,13 +250,13 @@ class CarlaEnv(gym.Env):
             camera1 = Camera("CameraDepth", PostProcessing="Depth")
             camera1.set_image_size(
                 self.config["render_x_res"], self.config["render_y_res"])
-            camera1.set_position(30, 0, 130)
+            camera1.set_position(0.30, 0, 1.30)
             settings.add_sensor(camera1)
 
         camera2 = Camera("CameraRGB")
         camera2.set_image_size(
             self.config["render_x_res"], self.config["render_y_res"])
-        camera2.set_position(30, 0, 130)
+        camera2.set_position(0.30, 0, 1.30)
 
         settings.add_sensor(camera2)
 
